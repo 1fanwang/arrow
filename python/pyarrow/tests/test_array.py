@@ -2671,6 +2671,110 @@ def test_array_from_numpy_temporal_unit_multiplier_overflow(
 
 
 @pytest.mark.numpy
+@pytest.mark.parametrize('numpy_type', ['datetime64', 'timedelta64'])
+@pytest.mark.parametrize('unit', ['s', 'ms', 'us'])
+@pytest.mark.parametrize('multiplier', [3, 10])
+@pytest.mark.parametrize('stride', [1, -1])
+@pytest.mark.parametrize('with_mask', [False, True])
+def test_array_from_numpy_temporal_unit_multiplier_cast(
+    numpy_type: str, unit: str, multiplier: int, stride: int, with_mask: bool
+) -> None:
+    intended = np.array(['1500-01-01', '2500-01-01'], dtype='datetime64[us]')
+    ticks = intended.astype(np.int64)
+    values = np.array(
+        [int(ticks[0]) * 1000 // multiplier, None,
+         int(ticks[1]) * 1000 // multiplier],
+        dtype=f'{numpy_type}[{multiplier}ns]',
+    )
+    # NumPy's direct 3ns-to-us cast overflows for these values.
+    normalized = values.astype(f'{numpy_type}[{multiplier}us]').astype(
+        f'{numpy_type}[us]'
+    )
+    np.testing.assert_array_equal(
+        normalized[[0, 2]].astype(np.int64), ticks
+    )
+    values = values[::stride]
+    normalized = normalized[::stride]
+    mask = np.array([True, False, False]) if with_mask else None
+    expected = pa.array(normalized.astype(f'{numpy_type}[{unit}]'), mask=mask)
+    for safe in [True, False]:
+        result = pa.array(values, type=expected.type, mask=mask, safe=safe)
+        assert result.equals(expected)
+
+
+@pytest.mark.numpy
+@pytest.mark.parametrize('numpy_type', ['datetime64', 'timedelta64'])
+def test_array_from_numpy_temporal_unit_multiplier_cast_truncation(
+    numpy_type: str,
+) -> None:
+    values = np.array([101, -101], dtype=f'{numpy_type}[10ns]')
+    target_type = pa.from_numpy_dtype(np.dtype(f'{numpy_type}[us]'))
+    with pytest.raises(pa.ArrowInvalid, match='would lose data'):
+        pa.array(values, type=target_type)
+
+    expected = pa.array(
+        np.array([1010, -1010], dtype=f'{numpy_type}[ns]')
+    ).cast(target_type, safe=False)
+    assert pa.array(values, type=target_type, safe=False).equals(expected)
+
+
+@pytest.mark.numpy
+@pytest.mark.parametrize('numpy_type', ['datetime64', 'timedelta64'])
+def test_array_from_numpy_temporal_unit_multiplier_cast_overflow(
+    numpy_type: str,
+) -> None:
+    values = np.array([np.iinfo(np.int64).max], dtype=f'{numpy_type}[2000ns]')
+    target_type = pa.from_numpy_dtype(np.dtype(f'{numpy_type}[us]'))
+    with pytest.raises(pa.ArrowInvalid):
+        pa.array(values, type=target_type)
+
+    expected = pa.array([-2], type=target_type)
+    assert pa.array(values, type=target_type, safe=False).equals(expected)
+
+
+@pytest.mark.numpy
+@pytest.mark.parametrize('target_type', [
+    pa.date32(), pa.date64(), pa.time32('s'), pa.time32('ms'),
+    pa.time64('us'), pa.time64('ns'),
+])
+def test_array_from_numpy_temporal_unit_multiplier_calendar_cast(
+    target_type: pa.DataType,
+) -> None:
+    intended = np.datetime64('2500-01-01T12:34:56', 'us')
+    values = np.array(
+        [int(intended.astype(np.int64)) * 100], dtype='datetime64[10ns]'
+    )
+    np.testing.assert_array_equal(
+        values.astype('datetime64[us]'), np.array([intended])
+    )
+    expected_value = (
+        datetime.date(2500, 1, 1) if pa.types.is_date(target_type)
+        else datetime.time(12, 34, 56)
+    )
+    expected = pa.array([expected_value], type=target_type)
+    assert pa.array(values, type=target_type).equals(expected)
+
+
+@pytest.mark.numpy
+@pytest.mark.parametrize('target_type', [pa.date32(), pa.date64()])
+def test_array_from_numpy_temporal_unit_multiplier_date_floor(
+    target_type: pa.DataType,
+) -> None:
+    values = np.array([-1, 1], dtype='datetime64[3ns]')
+    expected = pa.array(np.array([-3, 3], dtype='datetime64[ns]')).cast(target_type)
+    assert pa.array(values, type=target_type).equals(expected)
+
+
+@pytest.mark.numpy
+@pytest.mark.parametrize('numpy_type', ['datetime64', 'timedelta64'])
+def test_array_from_numpy_temporal_unit_multiplier_one_zero_copy(
+    numpy_type: str,
+) -> None:
+    values = np.array([0, 1, 2], dtype=f'{numpy_type}[ns]')
+    assert pa.array(values).buffers()[1].address == values.ctypes.data
+
+
+@pytest.mark.numpy
 def test_array_from_different_numpy_datetime_units_raises():
     data = [
         None,

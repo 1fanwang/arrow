@@ -21,6 +21,7 @@
 #include "arrow/python/numpy_interop.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -40,11 +41,13 @@
 #include "arrow/util/bitmap_generate.h"
 #include "arrow/util/bitmap_ops.h"
 #include "arrow/util/checked_cast.h"
+#include "arrow/util/decimal.h"
 #include "arrow/util/endian.h"
 #include "arrow/util/int_util_overflow.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/string.h"
+#include "arrow/util/time.h"
 #include "arrow/util/utf8.h"
 #include "arrow/visit_type_inline.h"
 
@@ -251,7 +254,8 @@ class NumPyConverter {
   // Called before ConvertData to ensure Numpy input buffer is in expected
   // Arrow layout
   template <typename ArrowType>
-  Status PrepareInputData(std::shared_ptr<Buffer>* data);
+  Status PrepareInputData(std::shared_ptr<Buffer>* data,
+                          std::shared_ptr<DataType>* input_type);
 
   // ----------------------------------------------------------------------
   // Traditional visitor conversion for non-object arrays
@@ -444,7 +448,8 @@ class NumPyStridedConverter {
 }  // namespace
 
 template <typename ArrowType>
-inline Status NumPyConverter::PrepareInputData(std::shared_ptr<Buffer>* data) {
+inline Status NumPyConverter::PrepareInputData(std::shared_ptr<Buffer>* data,
+                                               std::shared_ptr<DataType>* input_type) {
   if (PyArray_ISBYTESWAPPED(arr_)) {
     // TODO
     return Status::NotImplemented("Byte-swapped arrays not supported");
@@ -467,40 +472,99 @@ inline Status NumPyConverter::PrepareInputData(std::shared_ptr<Buffer>* data) {
     *data = std::make_shared<NumPyBuffer>(reinterpret_cast<PyObject*>(arr_));
   }
 
-  if (dtype_->type_num == NPY_DATETIME || dtype_->type_num == NPY_TIMEDELTA) {
-    const auto* metadata =
-        reinterpret_cast<PyArray_DatetimeDTypeMetaData*>(PyDataType_C_METADATA(dtype_));
-    const int64_t multiplier = metadata->meta.num;
-    if (multiplier != 1) {
-      ARROW_ASSIGN_OR_RAISE(auto scaled, AllocateBuffer((*data)->size(), pool_));
-      const auto* input_values = reinterpret_cast<const int64_t*>((*data)->data());
-      auto* output_values = reinterpret_cast<int64_t*>(scaled->mutable_data());
-      for (int64_t i = 0; i < length_; ++i) {
-        const int64_t value = input_values[i];
-        if (internal::npy_traits<NPY_DATETIME>::isnull(value) ||
-            (null_bitmap_ && !bit_util::GetBit(null_bitmap_->data(), i))) {
-          output_values[i] = value;
-        } else if (cast_options_.allow_time_overflow) {
-          output_values[i] = static_cast<int64_t>(static_cast<uint64_t>(value) *
-                                                  static_cast<uint64_t>(multiplier));
-        } else if (::arrow::internal::MultiplyWithOverflow(value, multiplier,
-                                                           &output_values[i])) {
-          return Status::Invalid("NumPy temporal value ", value, " with unit multiplier ",
-                                 multiplier, " causes int64 overflow");
-        }
-      }
-      *data = std::move(scaled);
+  ARROW_ASSIGN_OR_RAISE(*input_type, NumPyDtypeToArrow(dtype_));
+  if (dtype_->type_num != NPY_DATETIME && dtype_->type_num != NPY_TIMEDELTA) {
+    return Status::OK();
+  }
+  const auto* metadata =
+      reinterpret_cast<PyArray_DatetimeDTypeMetaData*>(PyDataType_C_METADATA(dtype_));
+  const int64_t multiplier = metadata->meta.num;
+  if (multiplier == 1) {
+    return Status::OK();
+  }
+
+  auto normalized_type = *input_type;
+  int64_t divisor = 1;
+  bool floor_to_date = false;
+  bool extract_time = false;
+  const bool is_timestamp = (*input_type)->id() == Type::TIMESTAMP;
+  if (is_timestamp || (*input_type)->id() == Type::DURATION) {
+    const TimeUnit::type input_unit =
+        is_timestamp ? checked_cast<const TimestampType&>(**input_type).unit()
+                     : checked_cast<const DurationType&>(**input_type).unit();
+    TimeUnit::type output_unit = input_unit;
+    if ((*input_type)->id() == type_->id()) {
+      output_unit = is_timestamp ? checked_cast<const TimestampType&>(*type_).unit()
+                                 : checked_cast<const DurationType&>(*type_).unit();
+    } else if (is_timestamp &&
+               (type_->id() == Type::DATE32 || type_->id() == Type::DATE64)) {
+      output_unit = TimeUnit::SECOND;
+      floor_to_date = true;
+    } else if (is_timestamp &&
+               (type_->id() == Type::TIME32 || type_->id() == Type::TIME64)) {
+      extract_time = true;
+    }
+    const auto conversion = util::GetTimestampConversion(input_unit, output_unit);
+    if (conversion.first == util::DIVIDE) {
+      divisor = conversion.second;
+      normalized_type = is_timestamp ? timestamp(output_unit) : duration(output_unit);
+    }
+    if (extract_time) {
+      const int64_t seconds_per_day =
+          std::chrono::duration_cast<std::chrono::seconds>(std::chrono::hours(24))
+              .count();
+      divisor = seconds_per_day *
+                util::GetTimestampConversion(TimeUnit::SECOND, input_unit).second;
     }
   }
+
+  ARROW_ASSIGN_OR_RAISE(auto scaled, AllocateBuffer((*data)->size(), pool_));
+  const auto* input_values = reinterpret_cast<const int64_t*>((*data)->data());
+  auto* output_values = reinterpret_cast<int64_t*>(scaled->mutable_data());
+  for (int64_t i = 0; i < length_; ++i) {
+    const int64_t value = input_values[i];
+    if (internal::npy_traits<NPY_DATETIME>::isnull(value) ||
+        (null_bitmap_ && !bit_util::GetBit(null_bitmap_->data(), i))) {
+      output_values[i] = value;
+    } else if (divisor != 1) {
+      // The requested unit can fit even when the base-unit value exceeds int64.
+      Decimal128 product(value);
+      product *= Decimal128(multiplier);
+      ARROW_ASSIGN_OR_RAISE(auto divided, product.Divide(Decimal128(divisor)));
+      if (!floor_to_date && !extract_time && !cast_options_.allow_time_truncate &&
+          divided.second != Decimal128()) {
+        return Status::Invalid("NumPy temporal cast would lose data: ", value);
+      }
+      Decimal128 result = extract_time ? divided.second : divided.first;
+      if (extract_time && result < Decimal128()) {
+        result += Decimal128(divisor);
+      } else if (floor_to_date && divided.second < Decimal128()) {
+        result -= Decimal128(1);
+      }
+      if (cast_options_.allow_time_overflow) {
+        output_values[i] = static_cast<int64_t>(result.low_bits());
+      } else {
+        ARROW_ASSIGN_OR_RAISE(output_values[i], result.ToInteger<int64_t>());
+      }
+    } else if (cast_options_.allow_time_overflow) {
+      output_values[i] = static_cast<int64_t>(static_cast<uint64_t>(value) *
+                                              static_cast<uint64_t>(multiplier));
+    } else if (::arrow::internal::MultiplyWithOverflow(value, multiplier,
+                                                       &output_values[i])) {
+      return Status::Invalid("NumPy temporal value ", value, " with unit multiplier ",
+                             multiplier, " causes int64 overflow");
+    }
+  }
+  *data = std::move(scaled);
+  *input_type = std::move(normalized_type);
 
   return Status::OK();
 }
 
 template <typename ArrowType>
 inline Status NumPyConverter::ConvertData(std::shared_ptr<Buffer>* data) {
-  RETURN_NOT_OK(PrepareInputData<ArrowType>(data));
-
-  ARROW_ASSIGN_OR_RAISE(auto input_type, NumPyDtypeToArrow(dtype_));
+  std::shared_ptr<DataType> input_type;
+  RETURN_NOT_OK(PrepareInputData<ArrowType>(data, &input_type));
 
   if (!input_type->Equals(*type_)) {
     RETURN_NOT_OK(CastBuffer(input_type, *data, length_, null_bitmap_, null_count_, type_,
@@ -514,7 +578,7 @@ template <>
 inline Status NumPyConverter::ConvertData<Date32Type>(std::shared_ptr<Buffer>* data) {
   std::shared_ptr<DataType> input_type;
 
-  RETURN_NOT_OK(PrepareInputData<Date32Type>(data));
+  RETURN_NOT_OK(PrepareInputData<Date32Type>(data, &input_type));
 
   auto date_dtype =
       reinterpret_cast<PyArray_DatetimeDTypeMetaData*>(PyDataType_C_METADATA(dtype_));
@@ -528,7 +592,6 @@ inline Status NumPyConverter::ConvertData<Date32Type>(std::shared_ptr<Buffer>* d
       Status s = StaticCastBuffer<int64_t, int32_t>(**data, length_, pool_, data);
       RETURN_NOT_OK(s);
     } else {
-      ARROW_ASSIGN_OR_RAISE(input_type, NumPyDtypeToArrow(dtype_));
       if (!input_type->Equals(*type_)) {
         // The null bitmap was already computed in VisitNative()
         RETURN_NOT_OK(CastBuffer(input_type, *data, length_, null_bitmap_, null_count_,
@@ -536,7 +599,6 @@ inline Status NumPyConverter::ConvertData<Date32Type>(std::shared_ptr<Buffer>* d
       }
     }
   } else {
-    ARROW_ASSIGN_OR_RAISE(input_type, NumPyDtypeToArrow(dtype_));
     if (!input_type->Equals(*type_)) {
       RETURN_NOT_OK(CastBuffer(input_type, *data, length_, null_bitmap_, null_count_,
                                type_, cast_options_, pool_, data));
@@ -551,7 +613,7 @@ inline Status NumPyConverter::ConvertData<Date64Type>(std::shared_ptr<Buffer>* d
   constexpr int64_t kMillisecondsInDay = 86400000;
   std::shared_ptr<DataType> input_type;
 
-  RETURN_NOT_OK(PrepareInputData<Date64Type>(data));
+  RETURN_NOT_OK(PrepareInputData<Date64Type>(data, &input_type));
 
   auto date_dtype =
       reinterpret_cast<PyArray_DatetimeDTypeMetaData*>(PyDataType_C_METADATA(dtype_));
@@ -570,7 +632,6 @@ inline Status NumPyConverter::ConvertData<Date64Type>(std::shared_ptr<Buffer>* d
       }
       *data = std::move(result);
     } else {
-      ARROW_ASSIGN_OR_RAISE(input_type, NumPyDtypeToArrow(dtype_));
       if (!input_type->Equals(*type_)) {
         // The null bitmap was already computed in VisitNative()
         RETURN_NOT_OK(CastBuffer(input_type, *data, length_, null_bitmap_, null_count_,
@@ -578,7 +639,6 @@ inline Status NumPyConverter::ConvertData<Date64Type>(std::shared_ptr<Buffer>* d
       }
     }
   } else {
-    ARROW_ASSIGN_OR_RAISE(input_type, NumPyDtypeToArrow(dtype_));
     if (!input_type->Equals(*type_)) {
       RETURN_NOT_OK(CastBuffer(input_type, *data, length_, null_bitmap_, null_count_,
                                type_, cast_options_, pool_, data));
