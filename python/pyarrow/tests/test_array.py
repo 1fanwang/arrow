@@ -2624,6 +2624,53 @@ def test_array_from_numpy_datetime(dtype, type):
 
 
 @pytest.mark.numpy
+@pytest.mark.parametrize(('numpy_type', 'unit'), [
+    ('datetime64', 'D'),
+    ('datetime64', 's'),
+    ('datetime64', 'ms'),
+    ('datetime64', 'us'),
+    ('datetime64', 'ns'),
+    ('timedelta64', 's'),
+    ('timedelta64', 'ms'),
+    ('timedelta64', 'us'),
+    ('timedelta64', 'ns'),
+])
+@pytest.mark.parametrize('multiplier', [1, 10])
+@pytest.mark.parametrize('stride', [1, -1])
+@pytest.mark.parametrize('with_mask', [False, True])
+def test_array_from_numpy_temporal_unit_multiplier(
+    numpy_type: str, unit: str, multiplier: int, stride: int, with_mask: bool
+) -> None:
+    values = np.array(
+        [-2, None, 0, 3, 8],
+        dtype=f'{numpy_type}[{multiplier}{unit}]',
+    )[::stride]
+    mask = np.array([False, False, True, False, False]) if with_mask else None
+    expected = pa.array(values.astype(f'{numpy_type}[{unit}]'), mask=mask)
+
+    for requested_type in [None, expected.type]:
+        result = pa.array(values, type=requested_type, mask=mask)
+        assert result.equals(expected)
+
+
+@pytest.mark.numpy
+@pytest.mark.parametrize('numpy_type', ['datetime64', 'timedelta64'])
+def test_array_from_numpy_temporal_unit_multiplier_overflow(
+    numpy_type: str,
+) -> None:
+    values = np.array([2**62 + 1], dtype=f'{numpy_type}[10ns]')
+    with pytest.raises(pa.ArrowInvalid, match='overflow'):
+        pa.array(values)
+
+    expected = pa.array(
+        [np.iinfo(np.int64).min + 10],
+        type=pa.from_numpy_dtype(np.dtype(f'{numpy_type}[ns]')),
+    )
+    assert pa.array(values, safe=False).equals(expected)
+    assert pa.array(values, mask=np.array([True])).null_count == 1
+
+
+@pytest.mark.numpy
 def test_array_from_different_numpy_datetime_units_raises():
     data = [
         None,
